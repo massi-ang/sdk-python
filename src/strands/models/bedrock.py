@@ -3,8 +3,10 @@
 - Docs: https://aws.amazon.com/bedrock/
 """
 
+import json
 import logging
 import os
+import uuid
 from typing import Any, Iterable, Literal, Optional, cast
 
 import boto3
@@ -29,6 +31,52 @@ BEDROCK_CONTEXT_WINDOW_OVERFLOW_MESSAGES = [
 ]
 
 
+class BedrockConfig(TypedDict, total=False):
+    """Configuration options for Bedrock models.
+
+    Attributes:
+        additional_args: Any additional arguments to include in the request
+        additional_request_fields: Additional fields to include in the Bedrock request
+        additional_response_field_paths: Additional response field paths to extract
+        cache_prompt: Cache point type for the system prompt
+        cache_tools: Cache point type for tools
+        guardrail_id: ID of the guardrail to apply
+        guardrail_trace: Guardrail trace mode. Defaults to enabled.
+        guardrail_version: Version of the guardrail to apply
+        guardrail_stream_processing_mode: The guardrail processing mode
+        guardrail_redact_input: Flag to redact input if a guardrail is triggered. Defaults to True.
+        guardrail_redact_input_message: If a Bedrock Input guardrail triggers, replace the input with this message.
+        guardrail_redact_output: Flag to redact output if guardrail is triggered. Defaults to False.
+        guardrail_redact_output_message: If a Bedrock Output guardrail triggers, replace output with this message.
+        max_tokens: Maximum number of tokens to generate in the response
+        model_id: The Bedrock model ID (e.g., "us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+        stop_sequences: List of sequences that will stop generation when encountered
+        streaming: Whether to use streaming mode (default: True)
+        temperature: Controls randomness in generation (higher = more random)
+        top_p: Controls diversity via nucleus sampling (alternative to temperature)
+    """
+
+    additional_args: Optional[dict[str, Any]]
+    additional_request_fields: Optional[dict[str, Any]]
+    additional_response_field_paths: Optional[list[str]]
+    cache_prompt: Optional[str]
+    cache_tools: Optional[str]
+    guardrail_id: Optional[str]
+    guardrail_trace: Optional[Literal["enabled", "disabled", "enabled_full"]]
+    guardrail_stream_processing_mode: Optional[Literal["sync", "async"]]
+    guardrail_version: Optional[str]
+    guardrail_redact_input: Optional[bool]
+    guardrail_redact_input_message: Optional[str]
+    guardrail_redact_output: Optional[bool]
+    guardrail_redact_output_message: Optional[str]
+    max_tokens: Optional[int]
+    model_id: str
+    stop_sequences: Optional[list[str]]
+    streaming: Optional[bool]
+    temperature: Optional[float]
+    top_p: Optional[float]
+
+
 class BedrockModel(Model):
     """AWS Bedrock model provider implementation.
 
@@ -41,48 +89,7 @@ class BedrockModel(Model):
     - Context window overflow detection
     """
 
-    class BedrockConfig(TypedDict, total=False):
-        """Configuration options for Bedrock models.
-
-        Attributes:
-            additional_args: Any additional arguments to include in the request
-            additional_request_fields: Additional fields to include in the Bedrock request
-            additional_response_field_paths: Additional response field paths to extract
-            cache_prompt: Cache point type for the system prompt
-            cache_tools: Cache point type for tools
-            guardrail_id: ID of the guardrail to apply
-            guardrail_trace: Guardrail trace mode. Defaults to enabled.
-            guardrail_version: Version of the guardrail to apply
-            guardrail_stream_processing_mode: The guardrail processing mode
-            guardrail_redact_input: Flag to redact input if a guardrail is triggered. Defaults to True.
-            guardrail_redact_input_message: If a Bedrock Input guardrail triggers, replace the input with this message.
-            guardrail_redact_output: Flag to redact output if guardrail is triggered. Defaults to False.
-            guardrail_redact_output_message: If a Bedrock Output guardrail triggers, replace output with this message.
-            max_tokens: Maximum number of tokens to generate in the response
-            model_id: The Bedrock model ID (e.g., "us.anthropic.claude-3-7-sonnet-20250219-v1:0")
-            stop_sequences: List of sequences that will stop generation when encountered
-            temperature: Controls randomness in generation (higher = more random)
-            top_p: Controls diversity via nucleus sampling (alternative to temperature)
-        """
-
-        additional_args: Optional[dict[str, Any]]
-        additional_request_fields: Optional[dict[str, Any]]
-        additional_response_field_paths: Optional[list[str]]
-        cache_prompt: Optional[str]
-        cache_tools: Optional[str]
-        guardrail_id: Optional[str]
-        guardrail_trace: Optional[Literal["enabled", "disabled", "enabled_full"]]
-        guardrail_stream_processing_mode: Optional[Literal["sync", "async"]]
-        guardrail_version: Optional[str]
-        guardrail_redact_input: Optional[bool]
-        guardrail_redact_input_message: Optional[str]
-        guardrail_redact_output: Optional[bool]
-        guardrail_redact_output_message: Optional[str]
-        max_tokens: Optional[int]
-        model_id: str
-        stop_sequences: Optional[list[str]]
-        temperature: Optional[float]
-        top_p: Optional[float]
+    BedrockConfig = BedrockConfig
 
     def __init__(
         self,
@@ -104,8 +111,12 @@ class BedrockModel(Model):
         if region_name and boto_session:
             raise ValueError("Cannot specify both `region_name` and `boto_session`.")
 
-        self.config = BedrockModel.BedrockConfig(model_id=DEFAULT_BEDROCK_MODEL_ID)
+        self.config = BedrockConfig(model_id=DEFAULT_BEDROCK_MODEL_ID)
         self.update_config(**model_config)
+
+        # Set default value for streaming flag if not provided
+        if "streaming" not in self.config:
+            self.config["streaming"] = True
 
         logger.debug("config=<%s> | initializing", self.config)
 
@@ -234,9 +245,10 @@ class BedrockModel(Model):
 
     @override
     def stream(self, request: dict[str, Any]) -> Iterable[dict[str, Any]]:
-        """Send the request to the Bedrock model and get the streaming response.
+        """Send the request to the Bedrock model and get the response.
 
-        This method calls the Bedrock converse_stream API and returns the stream of response events.
+        This method calls either the Bedrock converse_stream API (streaming mode)
+        or the Bedrock converse API (non-streaming mode) based on the streaming flag.
 
         Args:
             request: The formatted request to send to the Bedrock model
@@ -246,63 +258,185 @@ class BedrockModel(Model):
 
         Raises:
             ContextWindowOverflowException: If the input exceeds the model's context window.
-            EventStreamError: For all other Bedrock API errors.
+            ModelThrottledException: If the request is throttled by Bedrock.
         """
-        try:
-            response = self.client.converse_stream(**request)
-            for chunk in response["stream"]:
-                if self.config.get("guardrail_redact_input", True) or self.config.get("guardrail_redact_output", False):
-                    if (
-                        "metadata" in chunk
-                        and "trace" in chunk["metadata"]
-                        and "guardrail" in chunk["metadata"]["trace"]
+        # Check if streaming mode is enabled
+        if self.config.get("streaming", True):
+            # Use streaming API
+            try:
+                response = self.client.converse_stream(**request)
+                for chunk in response["stream"]:
+                    if self.config.get("guardrail_redact_input", True) or self.config.get(
+                        "guardrail_redact_output", False
                     ):
-                        inputAssessment = chunk["metadata"]["trace"]["guardrail"].get("inputAssessment", {})
-                        outputAssessments = chunk["metadata"]["trace"]["guardrail"].get("outputAssessments", {})
-
-                        # Check if an input or output guardrail was triggered
-                        if any(
-                            self._find_detected_and_blocked_policy(assessment)
-                            for assessment in inputAssessment.values()
-                        ) or any(
-                            self._find_detected_and_blocked_policy(assessment)
-                            for assessment in outputAssessments.values()
+                        if (
+                            "metadata" in chunk
+                            and "trace" in chunk["metadata"]
+                            and "guardrail" in chunk["metadata"]["trace"]
                         ):
-                            if self.config.get("guardrail_redact_input", True):
-                                logger.debug("Found blocked input guardrail. Redacting input.")
-                                yield {
-                                    "redactContent": {
-                                        "redactUserContentMessage": self.config.get(
-                                            "guardrail_redact_input_message", "[User input redacted.]"
-                                        )
-                                    }
-                                }
-                            if self.config.get("guardrail_redact_output", False):
-                                logger.debug("Found blocked output guardrail. Redacting output.")
-                                yield {
-                                    "redactContent": {
-                                        "redactAssistantContentMessage": self.config.get(
-                                            "guardrail_redact_output_message", "[Assistant output redacted.]"
-                                        )
-                                    }
-                                }
+                            inputAssessment = chunk["metadata"]["trace"]["guardrail"].get("inputAssessment", {})
+                            outputAssessments = chunk["metadata"]["trace"]["guardrail"].get("outputAssessments", {})
 
+                            # Check if an input or output guardrail was triggered
+                            if any(
+                                self._find_detected_and_blocked_policy(assessment)
+                                for assessment in inputAssessment.values()
+                            ) or any(
+                                self._find_detected_and_blocked_policy(assessment)
+                                for assessment in outputAssessments.values()
+                            ):
+                                if self.config.get("guardrail_redact_input", True):
+                                    logger.debug("Found blocked input guardrail. Redacting input.")
+                                    yield {
+                                        "redactContent": {
+                                            "redactUserContentMessage": self.config.get(
+                                                "guardrail_redact_input_message",
+                                                "[User input redacted.]",
+                                            )
+                                        }
+                                    }
+                                if self.config.get("guardrail_redact_output", False):
+                                    logger.debug("Found blocked output guardrail. Redacting output.")
+                                    yield {
+                                        "redactContent": {
+                                            "redactAssistantContentMessage": self.config.get(
+                                                "guardrail_redact_output_message",
+                                                "[Assistant output redacted.]",
+                                            )
+                                        }
+                                    }
+
+                    yield chunk
+            except EventStreamError as e:
+                # Handle throttling that occurs mid-stream?
+                if "ThrottlingException" in str(e) and "ConverseStream" in str(e):
+                    raise ModelThrottledException(str(e)) from e
+
+                if any(overflow_message in str(e) for overflow_message in BEDROCK_CONTEXT_WINDOW_OVERFLOW_MESSAGES):
+                    logger.warning("bedrock threw context window overflow error")
+                    raise ContextWindowOverflowException(e) from e
+                raise e
+            except ClientError as e:
+                # Handle throttling that occurs at the beginning of the call
+                if e.response["Error"]["Code"] == "ThrottlingException":
+                    raise ModelThrottledException(str(e)) from e
+
+                raise
+        else:
+            # Use non-streaming API
+            response = self._complete_response(request)
+            for chunk in self._format_complete_response(response):
                 yield chunk
-        except EventStreamError as e:
-            # Handle throttling that occurs mid-stream?
-            if "ThrottlingException" in str(e) and "ConverseStream" in str(e):
-                raise ModelThrottledException(str(e)) from e
 
-            if any(overflow_message in str(e) for overflow_message in BEDROCK_CONTEXT_WINDOW_OVERFLOW_MESSAGES):
-                logger.warning("bedrock threw context window overflow error")
-                raise ContextWindowOverflowException(e) from e
-            raise e
+    def _complete_response(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Get a complete response from the Bedrock model.
+
+        This method calls the Bedrock converse API (non-streaming) and returns the complete response.
+
+        Args:
+            request: The formatted request to send to the Bedrock model.
+
+        Returns:
+            A complete response from the Bedrock model.
+
+        Raises:
+            ContextWindowOverflowException: If the input exceeds the model's context window.
+            ModelThrottledException: If the request is throttled by Bedrock.
+        """
+        # Remove streaming-specific parameters if present
+        non_streaming_request = {k: v for k, v in request.items() if k != "stream"}
+
+        try:
+            # Call the non-streaming API
+            response = self.client.converse(**non_streaming_request)
+            return response
         except ClientError as e:
-            # Handle throttling that occurs at the beginning of the call
+            # Handle throttling
             if e.response["Error"]["Code"] == "ThrottlingException":
                 raise ModelThrottledException(str(e)) from e
 
-            raise
+            # Handle context window overflow
+            error_message = str(e)
+            if any(overflow_message in error_message for overflow_message in BEDROCK_CONTEXT_WINDOW_OVERFLOW_MESSAGES):
+                logger.warning("bedrock threw context window overflow error")
+                raise ContextWindowOverflowException(e) from e
+            raise e
+
+    def _format_complete_response(self, response: dict[str, Any]) -> Iterable[dict[str, Any]]:
+        """Format a complete response as a series of events that mimic streaming.
+
+        This method formats a complete response as a series of events with the same
+        structure as streaming events, following the StreamEvent format. This ensures
+        that the format_chunk method can remain unchanged and handle both streaming
+        and non-streaming responses.
+
+        Args:
+            response: The complete response from the Bedrock model.
+
+        Yields:
+            A series of events that mimic streaming events.
+        """
+        # First yield message_start
+        yield {"messageStart": {"role": "assistant"}}
+
+        # Process content items
+        content_array = response.get("output", {}).get("message", {}).get("content", [])
+
+        for i, content_item in enumerate(content_array):
+            if "text" in content_item:
+                # Handle text content
+                yield {"contentBlockStart": {"contentBlockIndex": i, "start": {"text": ""}}}
+
+                yield {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": i,
+                        "delta": {"text": content_item["text"]},
+                    }
+                }
+
+                yield {"contentBlockStop": {"contentBlockIndex": i}}
+
+            elif "toolUse" in content_item:
+                # Handle tool use
+                tool_use = content_item["toolUse"]
+                tool_id = tool_use.get("toolUseId", f"tool_{uuid.uuid4()}")
+                tool_name = tool_use.get("name", "")
+                tool_input = tool_use.get("input", None)
+                # if tool_input is None:
+                #     continue
+                yield {
+                    "contentBlockStart": {
+                        "contentBlockIndex": i,
+                        "start": {"toolUse": {"toolUseId": tool_id, "name": tool_name}},
+                    }
+                }
+
+                # If the input is not empty, yield it as a delta
+                if tool_input:
+                    input_str = json.dumps(tool_input) if isinstance(tool_input, dict) else str(tool_input)
+                    yield {
+                        "contentBlockDelta": {
+                            "contentBlockIndex": i,
+                            "delta": {"toolUse": {"input": input_str}},
+                        }
+                    }
+
+                yield {"contentBlockStop": {"contentBlockIndex": i}}
+
+        # Finally yield message_stop and metadata
+        has_tool_uses = any("toolUse" in item for item in content_array)
+        stop_reason = response.get("stopReason", "tool_use" if has_tool_uses else "end_turn")
+
+        yield {"messageStop": {"stopReason": stop_reason}}
+
+        # Yield usage and metrics information if available
+        if "usage" in response or "metrics" in response:
+            yield {
+                "metadata": {
+                    "usage": response.get("usage", {}),
+                    "metrics": response.get("metrics", {}),
+                }
+            }
 
     def _find_detected_and_blocked_policy(self, input: Any) -> bool:
         """Recursively checks if the assessment contains a detected and blocked guardrail.

@@ -41,7 +41,10 @@ class Model(abc.ABC):
     @abc.abstractmethod
     # pragma: no cover
     def format_request(
-        self, messages: Messages, tool_specs: Optional[list[ToolSpec]] = None, system_prompt: Optional[str] = None
+        self,
+        messages: Messages,
+        tool_specs: Optional[list[ToolSpec]] = None,
+        system_prompt: Optional[str] = None,
     ) -> Any:
         """Format a streaming request to the underlying model.
 
@@ -85,7 +88,10 @@ class Model(abc.ABC):
         pass
 
     def converse(
-        self, messages: Messages, tool_specs: Optional[list[ToolSpec]] = None, system_prompt: Optional[str] = None
+        self,
+        messages: Messages,
+        tool_specs: Optional[list[ToolSpec]] = None,
+        system_prompt: Optional[str] = None,
     ) -> Iterable[StreamEvent]:
         """Converse with the model.
 

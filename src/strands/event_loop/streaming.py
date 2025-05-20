@@ -102,7 +102,10 @@ def handle_content_block_start(event: ContentBlockStartEvent) -> Dict[str, Any]:
 
 
 def handle_content_block_delta(
-    event: ContentBlockDeltaEvent, state: Dict[str, Any], callback_handler: Any, **kwargs: Any
+    event: ContentBlockDeltaEvent,
+    state: Dict[str, Any],
+    callback_handler: Any,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Handles content block delta updates by appending text, tool input, or reasoning content to the state.
 
